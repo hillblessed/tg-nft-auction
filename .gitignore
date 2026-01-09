@@ -27,3 +27,8 @@ coverage/
 # Docker volumes (local)
 mongodb_data/
 redis_data/
+
+# Backups
+*.zip
+*.tar.gz
+*.backup

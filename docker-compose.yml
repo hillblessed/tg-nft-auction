@@ -12,7 +12,7 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
-      MONGODB_URI: mongodb://admin:auction_secret_2024@mongodb:27017/auction_db?authSource=admin
+      MONGODB_URI: mongodb://admin:${MONGO_PASSWORD:-changeme}@mongodb:27017/auction_db?authSource=admin
       REDIS_HOST: redis
       REDIS_PORT: 6379
       ANTI_SNIPE_WINDOW_SECONDS: 30
@@ -39,7 +39,7 @@ services:
       - "27017:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: auction_secret_2024
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-changeme}
       MONGO_INITDB_DATABASE: auction_db
     volumes:
       - mongodb_data:/data/db
