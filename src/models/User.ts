@@ -15,12 +15,22 @@ const userSchema = new Schema<IUser>(
       required: true,
       default: 0,
       min: [0, 'Balance cannot be negative'],
+      // Stored in minimal units (e.g. cents) to avoid floating point errors
+      validate: {
+        validator: Number.isInteger,
+        message: '{VALUE} is not an integer value'
+      }
     },
     frozenFunds: {
       type: Number,
       required: true,
       default: 0,
       min: [0, 'Frozen funds cannot be negative'],
+      // Stored in minimal units (e.g. cents)
+      validate: {
+        validator: Number.isInteger,
+        message: '{VALUE} is not an integer value'
+      }
     },
   },
   {

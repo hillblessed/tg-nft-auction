@@ -35,7 +35,7 @@ socket.on('disconnect', () => {
 
 // Real-time event handlers
 socket.on('newBid', (data) => {
-  logEvent(`New bid: ${data.amount} from ...${data.oderId.slice(-6)}`, 'bid');
+  logEvent(`New bid: ${data.amount} from ...${data.userId.slice(-6)}`, 'bid');
   if (currentAuction && data.auctionId === currentAuction._id) {
     fetchLeaderboard();
   }

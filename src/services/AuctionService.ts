@@ -35,7 +35,7 @@ export class AuctionService {
 
   private findActiveRound(auction: IAuction): IRound | null {
     const now = new Date();
-    
+
     for (const round of auction.rounds) {
       if (
         round.status === RoundStatus.ACTIVE &&
@@ -45,7 +45,7 @@ export class AuctionService {
         return round;
       }
     }
-    
+
     return null;
   }
 
@@ -58,124 +58,149 @@ export class AuctionService {
       throw new InvalidBidAmountError('Bid amount must be positive');
     }
 
-    const auction = await Auction.findById(auctionId);
-    
-    if (!auction) {
-      throw new AuctionNotFoundError(auctionId.toString());
-    }
-
-    if (auction.status !== AuctionStatus.ACTIVE) {
-      throw new AuctionNotActiveError(auctionId.toString());
-    }
-
-    const activeRound = this.findActiveRound(auction);
-    
-    if (!activeRound) {
-      throw new RoundNotActiveError(auctionId.toString(), auction.currentRound);
-    }
-
-    const existingBid = await Bid.findOne({
-      userId,
-      auctionId,
-      status: { $in: [BidStatus.ACTIVE, BidStatus.CARRIED_OVER] },
-    });
-
-    let bid: IBid;
-    let roundExtended = false;
-    let newEndTime: Date | undefined;
-
-    if (existingBid) {
-      // Bid increment: amount is the ADDITIONAL sum to add to existing bid
-      if (amount <= 0) {
-        throw new InvalidBidAmountError('Additional amount must be greater than 0');
-      }
-
-      // Lock the additional amount
-      await this.walletService.lockFunds(userId, amount);
-
-      // Update existing bid: add the amount to current bid
-      const newTotalBid = existingBid.amount + amount;
-      existingBid.amount = newTotalBid;
-      existingBid.updatedAt = new Date();
-      await existingBid.save();
-
-      bid = existingBid;
-    } else {
-      // New bid
-      await this.walletService.lockFunds(userId, amount);
-
-      bid = new Bid({
-        userId,
-        auctionId,
-        amount,
-        status: BidStatus.ACTIVE,
-        roundNumber: activeRound.roundNumber,
-        originalRound: activeRound.roundNumber,
-        isCarriedOver: false,
-      });
-
-      await bid.save();
-    }
-
-    const now = new Date();
-    const timeUntilEnd = activeRound.endTime.getTime() - now.getTime();
-    const antiSnipeWindow = config.antiSnipeWindowSeconds * 1000;
-
-    if (timeUntilEnd > 0 && timeUntilEnd <= antiSnipeWindow) {
-      const extensionMs = config.antiSnipeExtensionSeconds * 1000;
-      newEndTime = new Date(activeRound.endTime.getTime() + extensionMs);
-
-      await Auction.updateOne(
-        { 
-          _id: auctionId, 
-          'rounds.roundNumber': activeRound.roundNumber 
-        },
-        {
-          $set: { 'rounds.$.endTime': newEndTime },
-          $inc: { 'rounds.$.extendedCount': 1 },
-        }
-      );
-
-      roundExtended = true;
-    }
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
     try {
-      const leaderboardKey = this.getRedisLeaderboardKey(
-        auctionId.toString(),
-        activeRound.roundNumber
-      );
-      
-      // Use bid.amount (total bid) not amount (which could be just the increment)
-      await this.redis.zadd(leaderboardKey, bid.amount, userId.toString());
-    } catch (redisError) {
-      console.error('Failed to update Redis leaderboard:', redisError);
-    }
+      const auction = await Auction.findById(auctionId).session(session);
 
-    const updatedAuction = await Auction.findById(auctionId);
-
-    if (this.io) {
-      this.io.emit('newBid', {
-        auctionId: auctionId.toString(),
-        oderId: userId.toString(),
-        amount: bid.amount, // Send total bid amount
-        roundNumber: activeRound.roundNumber,
-      });
-
-      if (roundExtended && newEndTime) {
-        this.io.emit('roundExtended', {
-          auctionId: auctionId.toString(),
-          roundNumber: activeRound.roundNumber,
-          newEndTime: newEndTime.toISOString(),
-        });
+      if (!auction) {
+        throw new AuctionNotFoundError(auctionId.toString());
       }
-    }
 
-    return {
-      bid,
-      auction: updatedAuction!,
-      roundExtended,
-      newEndTime,
-    };
+      if (auction.status !== AuctionStatus.ACTIVE) {
+        throw new AuctionNotActiveError(auctionId.toString());
+      }
+
+      const activeRound = this.findActiveRound(auction);
+
+      if (!activeRound) {
+        throw new RoundNotActiveError(auctionId.toString(), auction.currentRound);
+      }
+
+      const existingBid = await Bid.findOne({
+        userId,
+        auctionId,
+        status: { $in: [BidStatus.ACTIVE, BidStatus.CARRIED_OVER] },
+      }).session(session);
+
+      let bid: IBid;
+      let roundExtended = false;
+      let newEndTime: Date | undefined;
+      let finalBidAmount = 0;
+
+      if (existingBid) {
+        // Bid increment
+        if (amount <= 0) {
+          throw new InvalidBidAmountError('Additional amount must be greater than 0');
+        }
+
+        // Lock additional amount
+        await this.walletService.lockFunds(userId, amount, session);
+
+        // Update existing bid
+        existingBid.amount += amount;
+        existingBid.updatedAt = new Date();
+        await existingBid.save({ session });
+
+        bid = existingBid;
+        finalBidAmount = existingBid.amount;
+      } else {
+        // New bid
+        await this.walletService.lockFunds(userId, amount, session);
+
+        bid = new Bid({
+          userId,
+          auctionId,
+          amount,
+          status: BidStatus.ACTIVE,
+          roundNumber: activeRound.roundNumber,
+          originalRound: activeRound.roundNumber,
+          isCarriedOver: false,
+        });
+
+        await bid.save({ session });
+        finalBidAmount = amount;
+      }
+
+      const now = new Date();
+      const timeUntilEnd = activeRound.endTime.getTime() - now.getTime();
+      const antiSnipeWindow = config.antiSnipeWindowSeconds * 1000;
+
+      if (timeUntilEnd > 0 && timeUntilEnd <= antiSnipeWindow) {
+        const extensionMs = config.antiSnipeExtensionSeconds * 1000;
+        newEndTime = new Date(activeRound.endTime.getTime() + extensionMs);
+
+        await Auction.updateOne(
+          {
+            _id: auctionId,
+            'rounds.roundNumber': activeRound.roundNumber
+          },
+          {
+            $set: { 'rounds.$.endTime': newEndTime },
+            $inc: { 'rounds.$.extendedCount': 1 },
+          },
+          { session }
+        );
+
+        roundExtended = true;
+      }
+
+      await session.commitTransaction(); // Commit critical DB changes
+
+      // Redis and Socket.IO updates happen AFTER commit. 
+      // Theoretically, if node crashing here, Redis might be stale.
+      // But critical data (money/bids) is safe in Mongo.
+
+      try {
+        const leaderboardKey = this.getRedisLeaderboardKey(
+          auctionId.toString(),
+          activeRound.roundNumber
+        );
+
+        await this.redis.zadd(leaderboardKey, finalBidAmount, userId.toString());
+      } catch (redisError) {
+        console.error('Failed to update Redis leaderboard:', redisError);
+      }
+
+      // Re-fetch auction for return value (without session)
+      const updatedAuction = await Auction.findById(auctionId);
+
+      if (this.io) {
+        this.io.emit('newBid', {
+          auctionId: auctionId.toString(),
+          userId: userId.toString(),
+          amount: finalBidAmount,
+          roundNumber: activeRound.roundNumber,
+        });
+
+        if (roundExtended && newEndTime) {
+          this.io.emit('roundExtended', {
+            auctionId: auctionId.toString(),
+            roundNumber: activeRound.roundNumber,
+            newEndTime: newEndTime.toISOString(),
+          });
+        }
+      }
+
+      if (!updatedAuction) {
+        // Should not happen as we just committed
+        throw new AuctionNotFoundError(auctionId.toString());
+      }
+
+      return {
+        bid,
+        auction: updatedAuction,
+        roundExtended,
+        newEndTime,
+      };
+
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      session.endSession();
+    }
   }
 
   async getLeaderboard(
@@ -184,11 +209,11 @@ export class AuctionService {
     limit: number = 100
   ): Promise<{ userId: string; amount: number; rank: number }[]> {
     const leaderboardKey = this.getRedisLeaderboardKey(auctionId.toString(), roundNumber);
-    
+
     const results = await this.redis.zrevrange(leaderboardKey, 0, limit - 1, 'WITHSCORES');
-    
+
     const leaderboard: { userId: string; amount: number; rank: number }[] = [];
-    
+
     for (let i = 0; i < results.length; i += 2) {
       leaderboard.push({
         userId: results[i],
@@ -206,7 +231,7 @@ export class AuctionService {
     roundNumber: number
   ): Promise<{ rank: number | null; amount: number | null }> {
     const leaderboardKey = this.getRedisLeaderboardKey(auctionId.toString(), roundNumber);
-    
+
     const rank = await this.redis.zrevrank(leaderboardKey, userId.toString());
     const score = await this.redis.zscore(leaderboardKey, userId.toString());
 
@@ -220,218 +245,259 @@ export class AuctionService {
     auctionId: mongoose.Types.ObjectId,
     roundNumber: number
   ): Promise<{ winnersCount: number; losersCarriedOver: number; losersRefunded: number }> {
-    const auction = await Auction.findById(auctionId);
-    
-    if (!auction) {
-      throw new AuctionNotFoundError(auctionId.toString());
-    }
+    // Note: Wrapping the entire process in one transaction might be heavy if many users.
+    // However, it ensures consistency. For a "demo" or MVB, this is acceptable.
+    // For high scale, valid strategies include batching or eventual consistency with queues.
 
-    const round = auction.rounds.find(r => r.roundNumber === roundNumber);
-    
-    if (!round) {
-      throw new RoundNotActiveError(auctionId.toString(), roundNumber);
-    }
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    if (round.status !== RoundStatus.ACTIVE) {
-      console.log(`Round ${roundNumber} is not active (status: ${round.status}), skipping`);
-      return { winnersCount: 0, losersCarriedOver: 0, losersRefunded: 0 };
-    }
+    try {
+      const auction = await Auction.findById(auctionId).session(session);
 
-    await Auction.updateOne(
-      { _id: auctionId, 'rounds.roundNumber': roundNumber },
-      { $set: { 'rounds.$.status': RoundStatus.FINALIZING } }
-    );
-
-    const leaderboardKey = this.getRedisLeaderboardKey(auctionId.toString(), roundNumber);
-    const itemsInRound = round.itemsInRound;
-
-    const winnersData = await this.redis.zrevrange(
-      leaderboardKey, 
-      0, 
-      itemsInRound - 1, 
-      'WITHSCORES'
-    );
-
-    const winners: { oderId: string; amount: number }[] = [];
-    for (let i = 0; i < winnersData.length; i += 2) {
-      winners.push({
-        oderId: winnersData[i],
-        amount: parseFloat(winnersData[i + 1]),
-      });
-    }
-
-    let winnersCount = 0;
-    let losersCarriedOver = 0;
-    let losersRefunded = 0;
-
-    const winnerUserIds = winners.map(w => new mongoose.Types.ObjectId(w.oderId));
-    const roundWinners: IAuction['rounds'][0]['winners'] = [];
-
-    for (let rankIdx = 0; rankIdx < winners.length; rankIdx++) {
-      const winner = winners[rankIdx];
-      const oderId = new mongoose.Types.ObjectId(winner.oderId);
-
-      const bid = await Bid.findOneAndUpdate(
-        {
-          userId: oderId,
-          auctionId,
-          status: { $in: [BidStatus.ACTIVE, BidStatus.CARRIED_OVER] },
-        },
-        {
-          $set: {
-            status: BidStatus.WON,
-            wonAt: new Date(),
-          },
-        },
-        { new: true }
-      );
-
-      if (bid) {
-        await this.walletService.deductFunds(oderId, winner.amount);
-        
-        // Assign item ownership to winner
-        const itemSerialNumber = (roundNumber - 1) * itemsInRound + rankIdx + 1;
-        await Item.findOneAndUpdate(
-          { auctionId, serialNumber: itemSerialNumber },
-          {
-            $set: {
-              ownerId: oderId,
-              roundWon: roundNumber,
-              wonAt: new Date(),
-              bidId: bid._id,
-            },
-          },
-          { upsert: true, new: true }
-        );
-        
-        roundWinners.push({
-          userId: oderId,
-          bidId: bid._id,
-          amount: winner.amount,
-          rank: rankIdx + 1,
-          wonAt: new Date(),
-        });
-        
-        winnersCount++;
-
-        // Emit item won event
-        if (this.io) {
-          this.io.emit('itemWon', {
-            auctionId: auctionId.toString(),
-            roundNumber,
-            userId: oderId.toString(),
-            itemSerialNumber,
-            amount: winner.amount,
-            rank: rankIdx + 1,
-          });
-        }
+      if (!auction) {
+        throw new AuctionNotFoundError(auctionId.toString());
       }
-    }
 
-    await Auction.updateOne(
-      { _id: auctionId, 'rounds.roundNumber': roundNumber },
-      { $set: { 'rounds.$.winners': roundWinners } }
-    );
+      const round = auction.rounds.find(r => r.roundNumber === roundNumber);
 
-    if (winnerUserIds.length > 0) {
-      await this.redis.zrem(leaderboardKey, ...winnerUserIds.map(id => id.toString()));
-    }
+      if (!round) {
+        throw new RoundNotActiveError(auctionId.toString(), roundNumber);
+      }
 
-    const remainingLosers = await this.redis.zrevrange(leaderboardKey, 0, -1, 'WITHSCORES');
-    const losers: { oderId: string; amount: number }[] = [];
-    
-    for (let i = 0; i < remainingLosers.length; i += 2) {
-      losers.push({
-        oderId: remainingLosers[i],
-        amount: parseFloat(remainingLosers[i + 1]),
-      });
-    }
-
-    const isLastRound = roundNumber >= auction.totalRounds;
-    const nextRoundNumber = roundNumber + 1;
-
-    if (isLastRound) {
-      for (const loser of losers) {
-        const loserUserId = new mongoose.Types.ObjectId(loser.oderId);
-
-        await Bid.updateOne(
-          {
-            userId: loserUserId,
-            auctionId,
-            status: { $in: [BidStatus.ACTIVE, BidStatus.CARRIED_OVER] },
-          },
-          {
-            $set: {
-              status: BidStatus.REFUNDED,
-              refundedAt: new Date(),
-            },
-          }
-        );
-
-        await this.walletService.refundFunds(loserUserId, loser.amount);
-        losersRefunded++;
+      if (round.status !== RoundStatus.ACTIVE) {
+        console.log(`Round ${roundNumber} is not active (status: ${round.status}), skipping`);
+        await session.abortTransaction();
+        return { winnersCount: 0, losersCarriedOver: 0, losersRefunded: 0 };
       }
 
       await Auction.updateOne(
-        { _id: auctionId },
-        { $set: { status: AuctionStatus.COMPLETED } }
+        { _id: auctionId, 'rounds.roundNumber': roundNumber },
+        { $set: { 'rounds.$.status': RoundStatus.FINALIZING } },
+        { session }
       );
-    } else {
-      const nextRoundKey = this.getRedisLeaderboardKey(auctionId.toString(), nextRoundNumber);
 
-      for (const loser of losers) {
-        const loserUserId = new mongoose.Types.ObjectId(loser.oderId);
+      // We rely on Redis for ranking, which is outside the transaction. 
+      // This is a common pattern: Redis = Truth for Ranking, Mongo = Truth for Balance.
+      const leaderboardKey = this.getRedisLeaderboardKey(auctionId.toString(), roundNumber);
+      const itemsInRound = round.itemsInRound;
 
-        await Bid.updateOne(
+      const winnersData = await this.redis.zrevrange(
+        leaderboardKey,
+        0,
+        itemsInRound - 1,
+        'WITHSCORES'
+      );
+
+      const winners: { userId: string; amount: number }[] = [];
+      for (let i = 0; i < winnersData.length; i += 2) {
+        winners.push({
+          userId: winnersData[i],
+          amount: parseFloat(winnersData[i + 1]),
+        });
+      }
+
+      let winnersCount = 0;
+      let losersCarriedOver = 0;
+      let losersRefunded = 0;
+
+      const winnerUserIds = winners.map(w => new mongoose.Types.ObjectId(w.userId));
+      const roundWinners: IAuction['rounds'][0]['winners'] = [];
+
+      for (let rankIdx = 0; rankIdx < winners.length; rankIdx++) {
+        const winner = winners[rankIdx];
+        const winnerId = new mongoose.Types.ObjectId(winner.userId);
+
+        const bid = await Bid.findOneAndUpdate(
           {
-            userId: loserUserId,
+            userId: winnerId,
             auctionId,
             status: { $in: [BidStatus.ACTIVE, BidStatus.CARRIED_OVER] },
           },
           {
             $set: {
-              status: BidStatus.CARRIED_OVER,
-              roundNumber: nextRoundNumber,
-              isCarriedOver: true,
+              status: BidStatus.WON,
+              wonAt: new Date(),
             },
-          }
+          },
+          { new: true, session }
         );
 
-        losersCarriedOver++;
+        if (bid) {
+          // Deduct from frozen funds
+          await this.walletService.deductFunds(winnerId, winner.amount, session);
+
+          const itemSerialNumber = (roundNumber - 1) * itemsInRound + rankIdx + 1;
+          await Item.findOneAndUpdate(
+            { auctionId, serialNumber: itemSerialNumber },
+            {
+              $set: {
+                ownerId: winnerId,
+                roundWon: roundNumber,
+                wonAt: new Date(),
+                bidId: bid._id,
+              },
+            },
+            { upsert: true, new: true, session } // upsert might be dangerous if items pre-generated but ok
+          );
+
+          roundWinners.push({
+            userId: winnerId,
+            bidId: bid._id,
+            amount: winner.amount,
+            rank: rankIdx + 1,
+            wonAt: new Date(),
+          });
+
+          winnersCount++;
+
+          if (this.io) {
+            this.io.emit('itemWon', {
+              auctionId: auctionId.toString(),
+              roundNumber,
+              userId: winnerId.toString(),
+              itemSerialNumber,
+              amount: winner.amount,
+              rank: rankIdx + 1,
+            });
+          }
+        }
       }
 
-      if (losers.length > 0) {
+      await Auction.updateOne(
+        { _id: auctionId, 'rounds.roundNumber': roundNumber },
+        { $set: { 'rounds.$.winners': roundWinners } },
+        { session }
+      );
+
+      // Get losers (all besides winners)
+      // Note: This logic assumes Redis is perfectly synced.
+      const remainingLosers = await this.redis.zrevrange(leaderboardKey, 0, -1, 'WITHSCORES');
+      const losers: { oderId: string; amount: number }[] = [];
+
+      // Filter out winners from the full list? 
+      // Actually zrevrange returns EVERYONE.
+      // We need to filter out those who are in winnerUserIds
+
+      const winnerIdsSet = new Set(winnerUserIds.map(id => id.toString()));
+
+      for (let i = 0; i < remainingLosers.length; i += 2) {
+        const uid = remainingLosers[i];
+        if (!winnerIdsSet.has(uid)) {
+          losers.push({
+            oderId: uid,
+            amount: parseFloat(remainingLosers[i + 1]),
+          });
+        }
+      }
+
+      const isLastRound = roundNumber >= auction.totalRounds;
+      const nextRoundNumber = roundNumber + 1;
+
+      if (isLastRound) {
+        for (const loser of losers) {
+          const loserUserId = new mongoose.Types.ObjectId(loser.oderId);
+
+          await Bid.updateOne(
+            {
+              userId: loserUserId,
+              auctionId,
+              status: { $in: [BidStatus.ACTIVE, BidStatus.CARRIED_OVER] },
+            },
+            {
+              $set: {
+                status: BidStatus.REFUNDED,
+                refundedAt: new Date(),
+              },
+            },
+            { session }
+          );
+
+          await this.walletService.refundFunds(loserUserId, loser.amount, session);
+          losersRefunded++;
+        }
+
+        await Auction.updateOne(
+          { _id: auctionId },
+          { $set: { status: AuctionStatus.COMPLETED } },
+          { session }
+        );
+      } else {
+
+        // Prepare Redis updates (pipeline) but execute AFTER commit
+        // Actually, we can't delay finding losers logic easily, but we can delay the Redis Write
+
+        for (const loser of losers) {
+          const loserUserId = new mongoose.Types.ObjectId(loser.oderId);
+
+          await Bid.updateOne(
+            {
+              userId: loserUserId,
+              auctionId,
+              status: { $in: [BidStatus.ACTIVE, BidStatus.CARRIED_OVER] },
+            },
+            {
+              $set: {
+                status: BidStatus.CARRIED_OVER,
+                roundNumber: nextRoundNumber,
+                isCarriedOver: true,
+              },
+            },
+            { session }
+          );
+
+          losersCarriedOver++;
+        }
+
+        // We will execute redis pipeline after commit.
+
+        await Auction.updateOne(
+          { _id: auctionId, 'rounds.roundNumber': nextRoundNumber },
+          { $set: { 'rounds.$.status': RoundStatus.ACTIVE } },
+          { session }
+        );
+
+        await Auction.updateOne(
+          { _id: auctionId },
+          { $set: { currentRound: nextRoundNumber } },
+          { session }
+        );
+      }
+
+      await Auction.updateOne(
+        { _id: auctionId, 'rounds.roundNumber': roundNumber },
+        { $set: { 'rounds.$.status': RoundStatus.COMPLETED } },
+        { session }
+      );
+
+      await session.commitTransaction();
+
+      // Post-commit Redis cleanup/updates
+      await this.redis.del(leaderboardKey); // Clear current round
+
+      if (!isLastRound && losers.length > 0) {
         const pipeline = this.redis.pipeline();
+        const nextRoundKey = this.getRedisLeaderboardKey(auctionId.toString(), nextRoundNumber);
         for (const loser of losers) {
           pipeline.zadd(nextRoundKey, loser.amount, loser.oderId);
         }
         await pipeline.exec();
       }
 
-      await Auction.updateOne(
-        { _id: auctionId, 'rounds.roundNumber': nextRoundNumber },
-        { $set: { 'rounds.$.status': RoundStatus.ACTIVE } }
+      console.log(
+        `✅ Round ${roundNumber} processed for auction ${auctionId}: ` +
+        `${winnersCount} winners, ${losersCarriedOver} carried over, ${losersRefunded} refunded`
       );
 
-      await Auction.updateOne(
-        { _id: auctionId },
-        { $set: { currentRound: nextRoundNumber } }
-      );
+      return { winnersCount, losersCarriedOver, losersRefunded };
+
+    } catch (error) {
+      console.error(`Error processing round ${roundNumber}:`, error);
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      session.endSession();
     }
-
-    await this.redis.del(leaderboardKey);
-
-    await Auction.updateOne(
-      { _id: auctionId, 'rounds.roundNumber': roundNumber },
-      { $set: { 'rounds.$.status': RoundStatus.COMPLETED } }
-    );
-
-    console.log(
-      `✅ Round ${roundNumber} processed for auction ${auctionId}: ` +
-      `${winnersCount} winners, ${losersCarriedOver} carried over, ${losersRefunded} refunded`
-    );
-
-    return { winnersCount, losersCarriedOver, losersRefunded };
   }
 
   async getAuctionById(auctionId: mongoose.Types.ObjectId): Promise<IAuction | null> {
@@ -504,7 +570,7 @@ export class AuctionService {
     // Create items for the auction
     const totalItems = itemsPerRound * totalRounds;
     const itemsData = [];
-    
+
     for (let i = 0; i < totalItems; i++) {
       itemsData.push({
         auctionId: auction._id,
@@ -520,7 +586,7 @@ export class AuctionService {
         },
       });
     }
-    
+
     await Item.insertMany(itemsData);
 
     if (this.io) {
